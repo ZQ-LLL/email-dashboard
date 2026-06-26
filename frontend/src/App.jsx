@@ -599,6 +599,11 @@ function ChatPanel({ onClose }) {
         body: JSON.stringify({ message: text, history }),
       })
 
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `HTTP ${res.status}`)
+      }
+
       const reader  = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
@@ -614,18 +619,19 @@ function ChatPanel({ onClose }) {
           if (!line.startsWith('data: ')) continue
           const payload = line.slice(6)
           if (payload === '[DONE]') continue
-          try {
-            const { delta, error } = JSON.parse(payload)
-            if (error) throw new Error(error)
-            if (delta) {
-              setMessages(prev => {
-                const next = [...prev]
-                const last = next[next.length - 1]
-                next[next.length - 1] = { ...last, content: last.content + delta }
-                return next
-              })
-            }
-          } catch { /* skip malformed chunks */ }
+          // Parse JSON separately so malformed chunks are skipped,
+          // but API-level errors are re-thrown to the outer catch.
+          let parsed
+          try { parsed = JSON.parse(payload) } catch { continue }
+          if (parsed.error) throw new Error(parsed.error)
+          if (parsed.delta) {
+            setMessages(prev => {
+              const next = [...prev]
+              const last = next[next.length - 1]
+              next[next.length - 1] = { ...last, content: last.content + parsed.delta }
+              return next
+            })
+          }
         }
       }
     } catch (err) {

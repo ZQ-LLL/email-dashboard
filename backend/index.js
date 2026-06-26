@@ -285,6 +285,7 @@ Answer the user's questions about these events concisely. If an event has no dat
   res.flushHeaders()
 
   try {
+    console.log('[chat] stream start:', message.slice(0, 60))
     const stream = await openai.chat.completions.create({
       model: 'anthropic/claude-haiku-4-5',
       max_tokens: 1024,
@@ -296,13 +297,16 @@ Answer the user's questions about these events concisely. If an event has no dat
       ],
     })
 
+    let chunks = 0
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta?.content
-      if (delta) res.write(`data: ${JSON.stringify({ delta })}\n\n`)
+      if (delta) { res.write(`data: ${JSON.stringify({ delta })}\n\n`); chunks++ }
     }
+    console.log('[chat] stream done, chunks:', chunks)
     res.write('data: [DONE]\n\n')
     res.end()
   } catch (err) {
+    console.error('[chat] error:', err.message)
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`)
     res.end()
   }
