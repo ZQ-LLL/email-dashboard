@@ -25,6 +25,11 @@ db.exec(`
     starred INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS blocked_senders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `)
 
 // Safe migration: add columns that may not exist in older DBs
@@ -33,24 +38,28 @@ for (const col of ['description TEXT', 'link TEXT']) {
 }
 
 const stmt = {
-  isAnalyzed:    db.prepare('SELECT 1 FROM analyzed_emails WHERE email_id = ?'),
-  markAnalyzed:  db.prepare('INSERT OR IGNORE INTO analyzed_emails (email_id) VALUES (?)'),
-  findByName:    db.prepare('SELECT * FROM events WHERE lower(trim(name)) = lower(trim(?))'),
-  insert:        db.prepare(`
+  isAnalyzed:       db.prepare('SELECT 1 FROM analyzed_emails WHERE email_id = ?'),
+  markAnalyzed:     db.prepare('INSERT OR IGNORE INTO analyzed_emails (email_id) VALUES (?)'),
+  findByName:       db.prepare('SELECT * FROM events WHERE lower(trim(name)) = lower(trim(?))'),
+  insert:           db.prepare(`
     INSERT INTO events (name, description, datetime, location, link, category, source_emails)
     VALUES (@name, @description, @datetime, @location, @link, @category, @source_emails)
   `),
-  updateSources: db.prepare('UPDATE events SET source_emails = ? WHERE id = ?'),
-  updateEvent:   db.prepare(`
+  updateSources:    db.prepare('UPDATE events SET source_emails = ? WHERE id = ?'),
+  updateEvent:      db.prepare(`
     UPDATE events
     SET name = @name, description = @description, datetime = @datetime,
         location = @location, link = @link, category = @category
     WHERE id = @id
   `),
-  deleteEvent:   db.prepare('DELETE FROM events WHERE id = ?'),
-  allEvents:     db.prepare('SELECT * FROM events ORDER BY created_at DESC'),
-  getEvent:      db.prepare('SELECT * FROM events WHERE id = ?'),
-  toggleStar:    db.prepare('UPDATE events SET starred = CASE WHEN starred = 1 THEN 0 ELSE 1 END WHERE id = ?'),
+  deleteEvent:      db.prepare('DELETE FROM events WHERE id = ?'),
+  allEvents:        db.prepare('SELECT * FROM events ORDER BY created_at DESC'),
+  getEvent:         db.prepare('SELECT * FROM events WHERE id = ?'),
+  toggleStar:       db.prepare('UPDATE events SET starred = CASE WHEN starred = 1 THEN 0 ELSE 1 END WHERE id = ?'),
+  allBlocked:       db.prepare('SELECT * FROM blocked_senders ORDER BY blocked_at DESC'),
+  isBlocked:        db.prepare('SELECT 1 FROM blocked_senders WHERE lower(email) = lower(?)'),
+  addBlocked:       db.prepare('INSERT OR IGNORE INTO blocked_senders (email) VALUES (?)'),
+  deleteBlocked:    db.prepare('DELETE FROM blocked_senders WHERE id = ?'),
 }
 
 const openai = new OpenAI({
@@ -117,6 +126,25 @@ app.get('/api/events', (req, res) => {
   res.json(stmt.allEvents.all())
 })
 
+app.get('/api/blocked', (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  res.json(stmt.allBlocked.all())
+})
+
+app.post('/api/blocked', (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  const { email } = req.body
+  if (!email?.trim()) return res.status(400).json({ error: 'Email required' })
+  stmt.addBlocked.run(email.trim().toLowerCase())
+  res.json(stmt.allBlocked.all())
+})
+
+app.delete('/api/blocked/:id', (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  stmt.deleteBlocked.run(req.params.id)
+  res.json(stmt.allBlocked.all())
+})
+
 app.patch('/api/events/:id', (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
   const { name, description, datetime, location, link, category } = req.body
@@ -169,6 +197,8 @@ app.get('/api/analyze', async (req, res) => {
     const nextPageToken = listRes.data.nextPageToken || null
     let processed = 0
 
+    const blockedSet = new Set(stmt.allBlocked.all().map(b => b.email.toLowerCase()))
+
     for (const msg of messages) {
       if (stmt.isAnalyzed.get(msg.id)) continue
 
@@ -181,6 +211,13 @@ app.get('/api/analyze', async (req, res) => {
       // RFC822 Message-ID header is unique per email and works with Gmail's rfc822msgid search
       // Case-insensitive match because mail servers use Message-ID, Message-Id, message-id, etc.
       const msgIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id')?.value || null
+
+      // Skip emails from blocked senders; still mark as analyzed so they stay skipped
+      const fromEmail = (from.match(/<(.+)>/) || [, from])[1].toLowerCase()
+      if (blockedSet.has(fromEmail)) {
+        stmt.markAnalyzed.run(msg.id)
+        continue
+      }
 
       const prompt = `You are a campus email assistant. Analyze the email below and determine whether it contains campus event information (lectures, job fairs, club activities, application deadlines, etc.).
 
@@ -214,7 +251,7 @@ Return only valid JSON — no explanation or markdown.`
         events = Array.isArray(parsed) ? parsed : []
       } catch { /* keep events = [] */ }
 
-      const sourceEntry = { id: msg.id, threadId, msgIdHeader, subject }
+      const sourceEntry = { id: msg.id, threadId, msgIdHeader, subject, from }
 
       db.transaction((evs, emailId) => {
         stmt.markAnalyzed.run(emailId)

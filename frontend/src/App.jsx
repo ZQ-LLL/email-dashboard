@@ -98,7 +98,7 @@ function gmailUrl(source) {
 }
 
 // ── Detail / Edit Modal ──
-function EventModal({ event, onClose, onStar, onSave, onDelete, userEmail }) {
+function EventModal({ event, onClose, onStar, onSave, onDelete, onBlock, userEmail }) {
   const [isEditing, setIsEditing]   = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
   const [form, setForm] = useState({
@@ -239,16 +239,37 @@ function EventModal({ event, onClose, onStar, onSave, onDelete, userEmail }) {
                   {sources.map((src, i) => {
                     const gmailQ   = gmailSearchQuery(src)
                     const subjectQ = emailSubject(src)
+                    const fromRaw  = typeof src === 'object' ? src.from : null
+                    const fromEmail = fromRaw
+                      ? (fromRaw.match(/<(.+)>/) || [, fromRaw])[1]
+                      : null
+                    const fromName = fromRaw
+                      ? (fromRaw.match(/^"?([^"<]+)"?\s*</) || [])[1]?.trim() || fromEmail
+                      : null
                     return (
                       <div key={i}>
-                        <a
-                          href={gmailUrl(src)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-sm text-blue-500 hover:text-blue-700 hover:underline"
-                        >
-                          View {sources.length > 1 ? `email ${i + 1}` : 'in Gmail'} →
-                        </a>
+                        <div className="flex items-center justify-between gap-2">
+                          <a
+                            href={gmailUrl(src)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-sm text-blue-500 hover:text-blue-700 hover:underline"
+                          >
+                            View {sources.length > 1 ? `email ${i + 1}` : 'in Gmail'} →
+                          </a>
+                          {fromEmail && onBlock && (
+                            <button
+                              onClick={() => onBlock(fromEmail)}
+                              className="text-xs text-red-400 hover:text-red-600 cursor-pointer transition-colors flex-shrink-0"
+                              title={`Block ${fromEmail}`}
+                            >
+                              Block sender
+                            </button>
+                          )}
+                        </div>
+                        {fromName && (
+                          <p className="text-xs text-gray-400 mt-0.5">From: {fromName}</p>
+                        )}
                         {(gmailQ || subjectQ) && (
                           <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                             <span className="text-xs text-gray-400">Copy search:</span>
@@ -572,6 +593,76 @@ function CalendarView({ events, onSelect, onStar, userEmail }) {
   )
 }
 
+// ── Settings Panel (blocked senders) ──
+function SettingsPanel({ blocked, onBlock, onUnblock, onClose }) {
+  const [input, setInput] = useState('')
+  const [adding, setAdding] = useState(false)
+
+  async function handleAdd() {
+    const email = input.trim().toLowerCase()
+    if (!email || adding) return
+    setAdding(true)
+    await onBlock(email)
+    setInput('')
+    setAdding(false)
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-5">
+            <h2 className="text-base font-bold text-gray-900">Blocked Senders</h2>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 cursor-pointer text-xl leading-none">✕</button>
+          </div>
+
+          {/* Add new */}
+          <div className="flex gap-2 mb-5">
+            <input
+              type="email"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleAdd()}
+              placeholder="sender@example.com"
+              className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+            />
+            <button
+              onClick={handleAdd}
+              disabled={!input.trim() || adding}
+              className="bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 text-white text-sm font-medium px-4 py-2 rounded-lg cursor-pointer disabled:cursor-not-allowed transition-colors"
+            >
+              Block
+            </button>
+          </div>
+
+          {/* List */}
+          {blocked.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-6">No blocked senders yet.</p>
+          ) : (
+            <div className="border border-gray-100 rounded-xl overflow-hidden">
+              {blocked.map(b => (
+                <div key={b.id} className="flex items-center justify-between px-4 py-3 border-b border-gray-100 last:border-0">
+                  <span className="text-sm text-gray-700 truncate mr-3">{b.email}</span>
+                  <button
+                    onClick={() => onUnblock(b.id)}
+                    className="text-xs text-red-500 hover:text-red-700 cursor-pointer flex-shrink-0"
+                  >
+                    Unblock
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <p className="text-xs text-gray-400 mt-4">
+            Emails from blocked senders will be skipped the next time you run analysis.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Chat Panel ──
 function ChatPanel({ onClose }) {
   const [messages, setMessages]   = useState([])
@@ -725,6 +816,8 @@ export default function App() {
   const [selectedId, setSelectedId]     = useState(null)
   const [customDays, setCustomDays]     = useState('30')
   const [chatOpen, setChatOpen]         = useState(false)
+  const [blocked, setBlocked]           = useState([])
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   const selectedEvent = events.find(e => e.id === selectedId) || null
 
@@ -738,6 +831,10 @@ export default function App() {
           fetch(`${API}/api/events`, { credentials: 'include' })
             .then(r => r.json())
             .then(setEvents)
+            .catch(() => {})
+          fetch(`${API}/api/blocked`, { credentials: 'include' })
+            .then(r => r.json())
+            .then(setBlocked)
             .catch(() => {})
         } else {
           setAuthStatus('loggedOut')
@@ -788,6 +885,21 @@ export default function App() {
     await fetch(`${API}/api/events/${id}`, { method: 'DELETE', credentials: 'include' })
     setEvents(prev => prev.filter(e => e.id !== id))
     setSelectedId(null)
+  }
+
+  async function blockSender(email) {
+    const res = await fetch(`${API}/api/blocked`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email }),
+    })
+    setBlocked(await res.json())
+  }
+
+  async function unblockSender(id) {
+    const res = await fetch(`${API}/api/blocked/${id}`, { method: 'DELETE', credentials: 'include' })
+    setBlocked(await res.json())
   }
 
   function handleLogout() {
@@ -859,7 +971,16 @@ export default function App() {
           onStar={handleStar}
           onSave={handleSave}
           onDelete={handleDelete}
+          onBlock={blockSender}
           userEmail={userEmail}
+        />
+      )}
+      {settingsOpen && (
+        <SettingsPanel
+          blocked={blocked}
+          onBlock={blockSender}
+          onUnblock={unblockSender}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
 
@@ -894,6 +1015,13 @@ export default function App() {
           <button onClick={() => runAnalysis()} disabled={analyzing}
             className="bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors cursor-pointer disabled:cursor-not-allowed">
             {analyzing ? 'Analyzing...' : 'Analyze Emails'}
+          </button>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            title="Blocked senders"
+            className="text-sm text-gray-500 hover:text-gray-800 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            ⚙️
           </button>
           <button onClick={handleLogout}
             className="text-sm text-gray-500 hover:text-gray-800 px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors cursor-pointer">
