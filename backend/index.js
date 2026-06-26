@@ -1,19 +1,29 @@
-const express = require('express')
-const cors = require('cors')
-const session = require('express-session')
-const { google } = require('googleapis')
-const OpenAI = require('openai')
-const Database = require('better-sqlite3')
+const express          = require('express')
+const cors             = require('cors')
+const session          = require('express-session')
+const { google }       = require('googleapis')
+const OpenAI           = require('openai')
+const { createClient } = require('@libsql/client')
 require('dotenv').config()
 
-// ── Database setup ──
-const db = new Database('events.db')
-db.exec(`
-  CREATE TABLE IF NOT EXISTS analyzed_emails (
+// ── Database ──
+// Locally: set TURSO_DATABASE_URL=file:events.db in .env (no auth token needed)
+// Production: set TURSO_DATABASE_URL=libsql://xxx.turso.io and TURSO_AUTH_TOKEN=xxx
+const db = createClient({
+  url:       process.env.TURSO_DATABASE_URL || 'file:events.db',
+  authToken: process.env.TURSO_AUTH_TOKEN,
+})
+
+async function q(sql, args = [])   { return (await db.execute({ sql, args })).rows }
+async function q1(sql, args = [])  { return (await q(sql, args))[0] ?? null }
+async function run(sql, args = []) { await db.execute({ sql, args }) }
+
+async function initDb() {
+  await run(`CREATE TABLE IF NOT EXISTS analyzed_emails (
     email_id TEXT PRIMARY KEY,
     analyzed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS events (
+  )`)
+  await run(`CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     description TEXT,
@@ -24,70 +34,55 @@ db.exec(`
     source_emails TEXT DEFAULT '[]',
     starred INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS blocked_senders (
+  )`)
+  await run(`CREATE TABLE IF NOT EXISTS blocked_senders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE,
     blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`)
-
-// Safe migration: add columns that may not exist in older DBs
-for (const col of ['description TEXT', 'link TEXT']) {
-  try { db.exec(`ALTER TABLE events ADD COLUMN ${col}`) } catch (_) {}
+  )`)
 }
 
-const stmt = {
-  isAnalyzed:       db.prepare('SELECT 1 FROM analyzed_emails WHERE email_id = ?'),
-  markAnalyzed:     db.prepare('INSERT OR IGNORE INTO analyzed_emails (email_id) VALUES (?)'),
-  findByName:       db.prepare('SELECT * FROM events WHERE lower(trim(name)) = lower(trim(?))'),
-  insert:           db.prepare(`
-    INSERT INTO events (name, description, datetime, location, link, category, source_emails)
-    VALUES (@name, @description, @datetime, @location, @link, @category, @source_emails)
-  `),
-  updateSources:    db.prepare('UPDATE events SET source_emails = ? WHERE id = ?'),
-  updateEvent:      db.prepare(`
-    UPDATE events
-    SET name = @name, description = @description, datetime = @datetime,
-        location = @location, link = @link, category = @category
-    WHERE id = @id
-  `),
-  deleteEvent:      db.prepare('DELETE FROM events WHERE id = ?'),
-  allEvents:        db.prepare('SELECT * FROM events ORDER BY created_at DESC'),
-  getEvent:         db.prepare('SELECT * FROM events WHERE id = ?'),
-  toggleStar:       db.prepare('UPDATE events SET starred = CASE WHEN starred = 1 THEN 0 ELSE 1 END WHERE id = ?'),
-  allBlocked:       db.prepare('SELECT * FROM blocked_senders ORDER BY blocked_at DESC'),
-  isBlocked:        db.prepare('SELECT 1 FROM blocked_senders WHERE lower(email) = lower(?)'),
-  addBlocked:       db.prepare('INSERT OR IGNORE INTO blocked_senders (email) VALUES (?)'),
-  deleteBlocked:    db.prepare('DELETE FROM blocked_senders WHERE id = ?'),
-}
-
+// ── OpenAI / OpenRouter ──
 const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENROUTER_API_KEY,
+  apiKey:  process.env.OPENROUTER_API_KEY,
 })
 
-const app = express()
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }))
+// ── Express ──
+const app    = express()
+const isProd = process.env.NODE_ENV === 'production'
+
+// Required when running behind Render's reverse proxy so secure cookies work
+if (isProd) app.set('trust proxy', 1)
+
+app.use(cors({
+  origin:      process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+}))
 app.use(express.json())
 app.use(session({
-  secret: process.env.SESSION_SECRET,
-  resave: false,
+  secret:            process.env.SESSION_SECRET,
+  resave:            false,
   saveUninitialized: false,
-  cookie: { secure: false },
+  cookie: {
+    httpOnly: true,
+    secure:   isProd,
+    sameSite: isProd ? 'none' : 'lax',
+  },
 }))
 
+// ── OAuth helpers ──
 function getOAuthClient() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    process.env.REDIRECT_URI
+    process.env.REDIRECT_URI,
   )
 }
 
+// ── Auth routes ──
 app.get('/auth/login', (req, res) => {
-  const oauth2Client = getOAuthClient()
-  const url = oauth2Client.generateAuthUrl({
+  const url = getOAuthClient().generateAuthUrl({
     access_type: 'offline',
     scope: ['https://www.googleapis.com/auth/gmail.readonly'],
   })
@@ -95,17 +90,15 @@ app.get('/auth/login', (req, res) => {
 })
 
 app.get('/auth/callback', async (req, res) => {
-  const { code } = req.query
   try {
     const oauth2Client = getOAuthClient()
-    const { tokens } = await oauth2Client.getToken(code)
+    const { tokens }   = await oauth2Client.getToken(req.query.code)
     req.session.tokens = tokens
-    // Fetch and store the user's email so the frontend can build correct Gmail URLs
     oauth2Client.setCredentials(tokens)
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
+    const gmail   = google.gmail({ version: 'v1', auth: oauth2Client })
     const profile = await gmail.users.getProfile({ userId: 'me' })
     req.session.userEmail = profile.data.emailAddress
-    res.redirect('http://localhost:5173')
+    res.redirect(process.env.FRONTEND_URL || 'http://localhost:5173')
   } catch (err) {
     res.status(500).json({ error: 'Authorization failed', detail: err.message })
   }
@@ -121,60 +114,61 @@ app.get('/auth/logout', (req, res) => {
   res.json({ success: true })
 })
 
-app.get('/api/events', (req, res) => {
+// ── Events ──
+app.get('/api/events', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  res.json(stmt.allEvents.all())
+  res.json(await q('SELECT * FROM events ORDER BY created_at DESC'))
 })
 
-app.get('/api/blocked', (req, res) => {
-  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  res.json(stmt.allBlocked.all())
-})
-
-app.post('/api/blocked', (req, res) => {
-  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  const { email } = req.body
-  if (!email?.trim()) return res.status(400).json({ error: 'Email required' })
-  stmt.addBlocked.run(email.trim().toLowerCase())
-  res.json(stmt.allBlocked.all())
-})
-
-app.delete('/api/blocked/:id', (req, res) => {
-  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  stmt.deleteBlocked.run(req.params.id)
-  res.json(stmt.allBlocked.all())
-})
-
-app.patch('/api/events/:id', (req, res) => {
+app.patch('/api/events/:id', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
   const { name, description, datetime, location, link, category } = req.body
   if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
-  stmt.updateEvent.run({
-    name: name.trim(),
-    description: description || null,
-    datetime:    datetime    || null,
-    location:    location    || null,
-    link:        link        || null,
-    category:    category    || 'Other',
-    id: parseInt(req.params.id),
-  })
-  res.json(stmt.getEvent.get(req.params.id))
+  await run(
+    'UPDATE events SET name = ?, description = ?, datetime = ?, location = ?, link = ?, category = ? WHERE id = ?',
+    [name.trim(), description || null, datetime || null, location || null, link || null, category || 'Other', parseInt(req.params.id)],
+  )
+  res.json(await q1('SELECT * FROM events WHERE id = ?', [req.params.id]))
 })
 
-app.delete('/api/events/:id', (req, res) => {
+app.delete('/api/events/:id', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  stmt.deleteEvent.run(req.params.id)
+  await run('DELETE FROM events WHERE id = ?', [req.params.id])
   res.json({ success: true })
 })
 
-app.patch('/api/events/:id/star', (req, res) => {
+app.patch('/api/events/:id/star', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
-  stmt.toggleStar.run(req.params.id)
-  const updated = stmt.getEvent.get(req.params.id)
+  await run(
+    'UPDATE events SET starred = CASE WHEN starred = 1 THEN 0 ELSE 1 END WHERE id = ?',
+    [req.params.id],
+  )
+  const updated = await q1('SELECT * FROM events WHERE id = ?', [req.params.id])
   if (!updated) return res.status(404).json({ error: 'Event not found' })
-  res.json({ id: updated.id, starred: !!updated.starred })
+  res.json({ id: Number(updated.id), starred: !!updated.starred })
 })
 
+// ── Blocked Senders ──
+app.get('/api/blocked', async (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  res.json(await q('SELECT * FROM blocked_senders ORDER BY blocked_at DESC'))
+})
+
+app.post('/api/blocked', async (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  const { email } = req.body
+  if (!email?.trim()) return res.status(400).json({ error: 'Email required' })
+  await run('INSERT OR IGNORE INTO blocked_senders (email) VALUES (?)', [email.trim().toLowerCase()])
+  res.json(await q('SELECT * FROM blocked_senders ORDER BY blocked_at DESC'))
+})
+
+app.delete('/api/blocked/:id', async (req, res) => {
+  if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
+  await run('DELETE FROM blocked_senders WHERE id = ?', [req.params.id])
+  res.json(await q('SELECT * FROM blocked_senders ORDER BY blocked_at DESC'))
+})
+
+// ── Analyze ──
 app.get('/api/analyze', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
 
@@ -187,8 +181,7 @@ app.get('/api/analyze', async (req, res) => {
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
 
     const listRes = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 30,
+      userId: 'me', maxResults: 30,
       q: `newer_than:${days}d`,
       ...(pageToken && { pageToken }),
     })
@@ -197,25 +190,24 @@ app.get('/api/analyze', async (req, res) => {
     const nextPageToken = listRes.data.nextPageToken || null
     let processed = 0
 
-    const blockedSet = new Set(stmt.allBlocked.all().map(b => b.email.toLowerCase()))
+    const blockedRows = await q('SELECT email FROM blocked_senders')
+    const blockedSet  = new Set(blockedRows.map(b => b.email.toLowerCase()))
 
     for (const msg of messages) {
-      if (stmt.isAnalyzed.get(msg.id)) continue
+      if (await q1('SELECT 1 FROM analyzed_emails WHERE email_id = ?', [msg.id])) continue
 
       const detail  = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' })
       const headers = detail.data.payload.headers
-      const subject = headers.find(h => h.name === 'Subject')?.value || '(No subject)'
-      const from    = headers.find(h => h.name === 'From')?.value    || ''
-      const body    = extractBody(detail.data.payload)
-      const threadId    = detail.data.threadId || msg.id
-      // RFC822 Message-ID header is unique per email and works with Gmail's rfc822msgid search
-      // Case-insensitive match because mail servers use Message-ID, Message-Id, message-id, etc.
+      const subject     = headers.find(h => h.name === 'Subject')?.value                  || '(No subject)'
+      const from        = headers.find(h => h.name === 'From')?.value                     || ''
       const msgIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id')?.value || null
+      const body        = extractBody(detail.data.payload)
+      const threadId    = detail.data.threadId || msg.id
 
-      // Skip emails from blocked senders; still mark as analyzed so they stay skipped
-      const fromEmail = (from.match(/<(.+)>/) || [, from])[1].toLowerCase()
+      // Skip blocked senders (still mark analyzed so they stay skipped)
+      const fromEmail = (from.match(/<(.+)>/) || [, from])[1]?.toLowerCase() || ''
       if (blockedSet.has(fromEmail)) {
-        stmt.markAnalyzed.run(msg.id)
+        await run('INSERT OR IGNORE INTO analyzed_emails (email_id) VALUES (?)', [msg.id])
         continue
       }
 
@@ -238,63 +230,60 @@ If no events are found, return [].
 Return only valid JSON — no explanation or markdown.`
 
       const completion = await openai.chat.completions.create({
-        model: 'anthropic/claude-haiku-4-5',
+        model:      'anthropic/claude-haiku-4-5',
         max_tokens: 1024,
-        messages: [{ role: 'user', content: prompt }],
+        messages:   [{ role: 'user', content: prompt }],
       })
 
       let events = []
       try {
-        const text   = completion.choices[0].message.content.trim()
-        const json   = text.replace(/^```json\n?/, '').replace(/\n?```$/, '')
-        const parsed = JSON.parse(json)
-        events = Array.isArray(parsed) ? parsed : []
+        const text = completion.choices[0].message.content.trim()
+        const json = text.replace(/^```json\n?/, '').replace(/\n?```$/, '')
+        events = Array.isArray(JSON.parse(json)) ? JSON.parse(json) : []
       } catch { /* keep events = [] */ }
 
       const sourceEntry = { id: msg.id, threadId, msgIdHeader, subject, from }
 
-      db.transaction((evs, emailId) => {
-        stmt.markAnalyzed.run(emailId)
-        for (const ev of evs) {
-          if (!ev.name?.trim()) continue
-          const existing = stmt.findByName.get(ev.name)
-          if (existing) {
-            const sources = JSON.parse(existing.source_emails || '[]')
-            const seen    = sources.some(s => (typeof s === 'string' ? s : s.id) === emailId)
-            if (!seen) {
-              stmt.updateSources.run(JSON.stringify([...sources, sourceEntry]), existing.id)
-            }
-          } else {
-            stmt.insert.run({
-              name:          ev.name.trim(),
-              description:   ev.description  || null,
-              datetime:      ev.datetime     || null,
-              location:      ev.location     || null,
-              link:          ev.link         || null,
-              category:      ev.category     || 'Other',
-              source_emails: JSON.stringify([sourceEntry]),
-            })
+      await run('INSERT OR IGNORE INTO analyzed_emails (email_id) VALUES (?)', [msg.id])
+      for (const ev of events) {
+        if (!ev.name?.trim()) continue
+        const existing = await q1(
+          'SELECT * FROM events WHERE lower(trim(name)) = lower(trim(?))', [ev.name],
+        )
+        if (existing) {
+          const sources = JSON.parse(existing.source_emails || '[]')
+          const seen    = sources.some(s => (typeof s === 'string' ? s : s.id) === msg.id)
+          if (!seen) {
+            await run(
+              'UPDATE events SET source_emails = ? WHERE id = ?',
+              [JSON.stringify([...sources, sourceEntry]), existing.id],
+            )
           }
+        } else {
+          await run(
+            'INSERT INTO events (name, description, datetime, location, link, category, source_emails) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [ev.name.trim(), ev.description || null, ev.datetime || null, ev.location || null, ev.link || null, ev.category || 'Other', JSON.stringify([sourceEntry])],
+          )
         }
-      })(events, msg.id)
-
+      }
       processed++
     }
 
-    res.json({ events: stmt.allEvents.all(), nextPageToken, processed, days })
+    res.json({ events: await q('SELECT * FROM events ORDER BY created_at DESC'), nextPageToken, processed, days })
   } catch (err) {
     res.status(500).json({ error: 'AI analysis failed', detail: err.message })
   }
 })
 
+// ── Chat (streaming SSE) ──
 app.post('/api/chat', async (req, res) => {
   if (!req.session.tokens) return res.status(401).json({ error: 'Not authenticated' })
 
   const { message, history = [] } = req.body
   if (!message?.trim()) return res.status(400).json({ error: 'Message required' })
 
-  const allEvents = stmt.allEvents.all()
-  const context = allEvents.length === 0
+  const allEvents = await q('SELECT * FROM events ORDER BY created_at DESC')
+  const context   = allEvents.length === 0
     ? 'No events have been analyzed yet.'
     : allEvents.map(ev => {
         const lines = [`- ${ev.name} [${ev.category}]`]
@@ -324,16 +313,13 @@ Answer the user's questions about these events concisely. If an event has no dat
   try {
     console.log('[chat] stream start:', message.slice(0, 60))
     const stream = await openai.chat.completions.create({
-      model: 'anthropic/claude-haiku-4-5',
-      max_tokens: 1024,
-      stream: true,
+      model: 'anthropic/claude-haiku-4-5', max_tokens: 1024, stream: true,
       messages: [
         { role: 'system', content: systemPrompt },
         ...history.map(h => ({ role: h.role, content: h.content })),
         { role: 'user', content: message },
       ],
     })
-
     let chunks = 0
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta?.content
@@ -349,15 +335,13 @@ Answer the user's questions about these events concisely. If an event has no dat
   }
 })
 
+// ── Helpers ──
 function extractBody(payload) {
-  if (payload.body?.data) {
-    return Buffer.from(payload.body.data, 'base64').toString('utf-8')
-  }
+  if (payload.body?.data) return Buffer.from(payload.body.data, 'base64').toString('utf-8')
   if (payload.parts) {
     for (const part of payload.parts) {
-      if (part.mimeType === 'text/plain' && part.body?.data) {
+      if (part.mimeType === 'text/plain' && part.body?.data)
         return Buffer.from(part.body.data, 'base64').toString('utf-8')
-      }
     }
     for (const part of payload.parts) {
       if (part.mimeType === 'text/html' && part.body?.data) {
@@ -369,6 +353,8 @@ function extractBody(payload) {
   return '(Body unavailable)'
 }
 
-app.listen(process.env.PORT || 3001, () => {
-  console.log(`Server running at http://localhost:${process.env.PORT || 3001}`)
-})
+// ── Start ──
+initDb()
+  .then(() => app.listen(process.env.PORT || 3001, () =>
+    console.log(`Server on port ${process.env.PORT || 3001}`)))
+  .catch(err => { console.error('DB init failed:', err); process.exit(1) })
