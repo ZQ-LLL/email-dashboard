@@ -8,7 +8,6 @@ function App() {
   const [emailsLoading, setEmailsLoading] = useState(false)
   const [error, setError] = useState(null)
 
-  // 启动时检查登录状态
   useEffect(() => {
     fetch(`${API}/auth/status`, { credentials: 'include' })
       .then(res => res.json())
@@ -21,7 +20,7 @@ function App() {
         }
       })
       .catch(() => {
-        setError('无法连接到后端，请确认后端在 3001 端口运行')
+        setError('Cannot reach backend — make sure the server is running on port 3001')
         setStatus('loggedOut')
       })
   }, [])
@@ -39,7 +38,7 @@ function App() {
         setEmailsLoading(false)
       })
       .catch(err => {
-        setError(`加载邮件失败：${err.message}`)
+        setError(`Failed to load emails: ${err.message}`)
         setEmailsLoading(false)
       })
   }
@@ -52,22 +51,20 @@ function App() {
       })
   }
 
-  // ── 加载中 ──
   if (status === 'loading') {
     return (
       <div style={styles.center}>
-        <p style={styles.muted}>正在检查登录状态...</p>
+        <p style={styles.muted}>Checking login status...</p>
       </div>
     )
   }
 
-  // ── 未登录 ──
   if (status === 'loggedOut') {
     return (
       <div style={styles.center}>
         <div style={styles.card}>
-          <h1 style={styles.title}>📬 Email Dashboard</h1>
-          <p style={styles.subtitle}>连接你的 Gmail，自动提取校园活动信息</p>
+          <h1 style={styles.title}>Email Dashboard</h1>
+          <p style={styles.subtitle}>Connect your Gmail to discover campus events</p>
           {error && <p style={styles.error}>{error}</p>}
           <a href={`${API}/auth/login`}>
             <button style={styles.btn}>Connect Gmail</button>
@@ -77,27 +74,28 @@ function App() {
     )
   }
 
-  // ── 已登录：邮件列表 ──
   return (
     <div style={styles.page}>
       <header style={styles.header}>
-        <h1 style={styles.title}>📬 Email Dashboard</h1>
-        <button style={styles.btnSmall} onClick={handleLogout}>退出登录</button>
+        <h1 style={styles.title}>Email Dashboard</h1>
+        <button style={styles.btnSmall} onClick={handleLogout}>Sign out</button>
       </header>
 
       {error && <p style={styles.error}>{error}</p>}
 
       {emailsLoading ? (
-        <p style={styles.muted}>正在加载邮件...</p>
+        <p style={styles.muted}>Loading emails...</p>
       ) : (
         <div>
-          <p style={styles.muted}>共加载 {emails.length} 封邮件</p>
+          <p style={styles.muted}>{emails.length} emails loaded</p>
           {emails.map(email => (
             <div key={email.id} style={styles.emailCard}>
               <p style={styles.emailSubject}>{email.subject}</p>
-              <p style={styles.emailMeta}>发件人：{email.from}</p>
-              <p style={styles.emailMeta}>时间：{email.date}</p>
-              <p style={styles.emailBody}>{email.body.slice(0, 200)}{email.body.length > 200 ? '...' : ''}</p>
+              <p style={styles.emailMeta}>From: {email.from}</p>
+              <p style={styles.emailMeta}>Date: {email.date}</p>
+              <p style={styles.emailBody}>
+                {email.body.slice(0, 200)}{email.body.length > 200 ? '...' : ''}
+              </p>
             </div>
           ))}
         </div>
